@@ -20,15 +20,21 @@ int autoFlag = 0;
 int manualFlag = 1;
 int potpin = 4;  // analog pin A4 used to connect the potentiometer
 
-int ledState = HIGH;         // the current state of the output pin
+//debouncing
+unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
+long debounceDelay = 300;    // the debounce time; increase if the output flickers
 int buttonState;             // the current reading from the input pin
 int lastButtonState = LOW;   // the previous reading from the input pin
-//nano has interrupt on pins 2 and 3 only
+
+//pushbutton interrupt
 volatile int autoInterrupt = 2; 
 volatile int manualInterrupt = 3;
 int autoCtr = 0;
 
-int command[] = {0,30,60,90,120,150,180,150,120,90,60,30}; //array for PWM signals
+unsigned long servoUpdate;
+int nextpos = 50; //interval to move to next servo position
+int servoPos = 0;
+int increment = 20;
 
 void setup() {
   
@@ -67,16 +73,18 @@ void loop() {
   {
     digitalWrite(ledPinTwo, HIGH); //red LED (manual on)
     digitalWrite(ledPin, LOW); //green LED (auto off)
+
+    //---waiting for potentiometer for manual control---
+    ///*
+
+    pos = analogRead(potpin);            // reads the value of the potentiometer (value between 0 and 1023)
+    pos = map(pos, 0, 1023, 0, 180);     // scale it to use it with the servo (value between 0 and 180)
+    testServo.write(pos);                  // sets the servo position according to the scaled value
+              
+    //*/
+    /*
     if (Serial.available()) 
     {
-       //---waiting for potentiometer for manual control---
-       /*
-
-        pos = analogRead(potpin);            // reads the value of the potentiometer (value between 0 and 1023)
-        pos = map(pos, 0, 1023, 0, 180);     // scale it to use it with the servo (value between 0 and 180)
-        testServo.write(pos);                  // sets the servo position according to the scaled value
-                
-        */
        //Serial.print("manual mode"); 
        //Control servo arm position from keyboard (-shift)
        PWMvalue = Serial.read();
@@ -91,22 +99,53 @@ void loop() {
          delay(15);            
        }    
     }
-  }
-  
-  //if pushbutton pressed, start auto sequence as autoFlag = 1;
-  digitalWrite(ledPin, HIGH); //green LED (auto on)
-  digitalWrite(ledPinTwo, LOW); //red LED (manual off) 
-  //automated servo sequence (after pushbutton pressed)
-  for (int i = 0; i < PWM_RANGE; i++)
-  {
-    testServo.write(command[i]);
-    delay(15);
+    */
   }
 
-  //if pushbutton is pressed a multiple of 3 stop auto mode
+  Serial.println(autoCtr); //check counter
+
+  // read the state of the switch into a local variable:
+  int reading = digitalRead(PushPin1);
+
+  // check to see if you just pressed the button 
+  // (i.e. the input went from LOW to HIGH),  and you've waited 
+  // long enough since the last press to ignore any noise:  
+
+  // If the switch changed, due to noise or pressing:
+  if (reading != lastButtonState) {
+    // reset the debouncing timer
+    lastDebounceTime = millis();
+  } 
+  
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // whatever the reading is at, it's been there for longer
+    // than the debounce delay, so take it as the actual current state:
+    buttonState = reading;
+  }
+  
+  // save the reading.  Next time through the loop,
+  // it'll be the lastButtonState:
+  lastButtonState = reading;
+  
+  //automated servo sequence (after pushbutton pressed)
+  digitalWrite(ledPin, HIGH); //green LED (auto on)
+  digitalWrite(ledPinTwo, LOW); //red LED (manual off) 
+
+  if (millis() - servoUpdate > nextpos)
+  {
+    servoUpdate = millis(); //remember time
+    servoPos += increment;
+    testServo.write(servoPos);
+    if ((servoPos >= 180) || (servoPos <= 0))
+    {
+      increment = - increment; //reverse direction
+    }
+  }
+
+   //if pushbutton is pressed a multiple of 3, stop auto mode
   //if not, continue running auto mode
   //0 -> press once -> 1 -> press twice -> 3
-  if (autoCtr != 3 == 0)
+  if (autoCtr % 3 == 0)
   {
     autoFlag = 0;
   }
