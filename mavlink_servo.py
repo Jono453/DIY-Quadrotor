@@ -1,4 +1,5 @@
 #Script to run on Pi with Mavlink + MissionPlanner (using Dronekit API)
+# Using spare (aux) PWM on PWM Ch5 or 6
 
 from dronekit import connect, VehicleMode, LocationGlobalRelative, LocationGlobal, Vehicle
 import time
