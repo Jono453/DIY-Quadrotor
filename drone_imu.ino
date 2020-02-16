@@ -12,7 +12,7 @@
 const int MPUAddress = 0x68;  // I2C address of the MPU-6050
 int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
 
-// MPU6050 DEFINES
+// MPU6050 Parameters
 #define POWER 0x6B
 #define ACCEL_XOUT_HIGH 0x3B
 #define GYRO_FACTOR 131  //leads to angular velocity in degrees/sec
@@ -29,7 +29,9 @@ int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
 #define PWM_PERIOD 20000 // 20ms in microseconds = 20x10^3 microseconds
 #define PWM_RESOLUTION 4096
 #define PWM_FREQUENCY 50 // 50Hz 1 - 2 ms for PWM at UAV motors
-int currPWM = 0;
+#define PWM_ARM 990.0
+#define PWM_BOTTOM 950.0
+float currPWM = PWM_BOTTOM;
 
 int pins_motors[] = {MOTOR_1,MOTOR_2,MOTOR_3,MOTOR_4};
 
@@ -47,12 +49,17 @@ void setupMotors(int pins_motors[],int num_pins)
 // freq = 1 / period
 // (PWM between 1000-2000 / 20ms) * 4096
 // PWM requires is 1 - 2 ms (1000 - 2000 micro sec)
-void send_motor_pwm()
+void send_motor_pwm(float currPWM)
 {
   float sentPWM = (currPWM / PWM_PERIOD) * PWM_RESOLUTION; 
-  for (int _pin_cnt = 0; _pin_cnt < _num_pins; _pin_cnt++) analogWrite(pins_motors[_pin_cnt], round(sentPWM));
+  for (int _pin_cnt = 0; _pin_cnt < 4; _pin_cnt++) analogWrite(pins_motors[_pin_cnt], round(sentPWM));
 }
 
+// Teensy status LED 
+void toggleLED(unsigned long dur)
+{
+  
+}
 
 // Declaring an union for the registers and the axis values.
 // The byte order does not match the byte order of
@@ -239,9 +246,22 @@ void loop(){
   switch (state)
   {
     case (STATE_IDLE):
+
+      unsigned long idle_timer;
+      if (millis() - idle_timer > 2000)
+      {
+        state = STATE_ARM;
+        currPWM = PWM_BOTTOM;      
+        idle_timer = millis();
+        break;  
+      }      
       break;
 
     case (STATE_ARM):
+
+      // Arm all 4 x motors
+      currPWM = PWM_ARM;
+      
       break;
 
     case (STATE_STABILIZE):
@@ -302,8 +322,9 @@ void loop(){
   //Printing the filtered roll and pitch angles for debugging
   sprintf(imuData,"%0.3f,%0.3f\n",cf_x + COMP_X_OFFSET,cf_y + COMP_Y_OFFSET);  
   Serial.print(imuData);  
+
+  send_motor_pwm(currPWM); //send PWM to UAV actuators
   
-  delay(10);
+  delay(15);
  }
   
-
