@@ -6,22 +6,57 @@
 // Adapted from tutorials/online resources
 // https://playground.arduino.cc/Main/MPU-6050/
 
+// Axes Convention for IMU
+//X axis = PITCH
+//Y axis = ROLL
+//Z axis = YAW
+
 #include <Wire.h> //for i2c
 #include <math.h> //math library
+
+// -------------PID constants-------------
+float kp = 0.5;
+float ki = 0.00;
+float kd = 0.1;
+// ---------------------------------------
+
+// Proportional
+float pid_px = 0.0;
+float pid_py = 0.0;
+
+// Integral
+float pid_ix = 0.0;
+float pid_iy = 0.0;
+
+// Derivative
+float pid_dx = 0.0;
+float pid_dy = 0.0;
+
+// Resultant PID result
+float pidx = 0.0;
+float pidy = 0.0;
+
+// Error
+float roll_error = 0.0;
+float pitch_error = 0.0; 
+
+float prev_roll_error = 0.0;
+float prev_pitch_error = 0.0;
 
 const int MPUAddress = 0x68;  // I2C address of the MPU-6050
 int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
 
-// MPU6050 DEFINES
+// MPU6050 Parameters
 #define POWER 0x6B
 #define ACCEL_XOUT_HIGH 0x3B
 #define GYRO_FACTOR 131  //leads to angular velocity in degrees/sec
 #define RAD2DEGREE 180/3.14159; //radians to degreees
 #define ACCEL_FACTOR 16384
-#define COMP_X_OFFSET 54.3
-#define COMP_Y_OFFSET -44.4
+#define COMP_X_OFFSET -40.9
+#define COMP_Y_OFFSET 44.30
 
 // ACTUATION PARAMS
+// Following Betaflight configuration for motors
 #define MOTOR_1 23
 #define MOTOR_2 22
 #define MOTOR_3 21
@@ -29,9 +64,17 @@ int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
 #define PWM_PERIOD 20000 // 20ms in microseconds = 20x10^3 microseconds
 #define PWM_RESOLUTION 4096
 #define PWM_FREQUENCY 50 // 50Hz 1 - 2 ms for PWM at UAV motors
-int currPWM = 0;
+#define PWM_ARM 990.0
+#define PWM_BOTTOM 950.0
+float currPWM = PWM_BOTTOM;
 
+unsigned long led_timer = 0;
+bool led_state = true;
 int pins_motors[] = {MOTOR_1,MOTOR_2,MOTOR_3,MOTOR_4};
+float pwm_motor_1 = 0.0;
+float pwm_motor_2 = 0.0;
+float pwm_motor_3 = 0.0;
+float pwm_motor_4 = 0.0;
 
 // Setting up PWM for Drone Actuators:
 void setupMotors(int pins_motors[],int num_pins)
@@ -47,12 +90,34 @@ void setupMotors(int pins_motors[],int num_pins)
 // freq = 1 / period
 // (PWM between 1000-2000 / 20ms) * 4096
 // PWM requires is 1 - 2 ms (1000 - 2000 micro sec)
-void send_motor_pwm()
+void send_motor_pwm_all(float currPWM)
 {
   float sentPWM = (currPWM / PWM_PERIOD) * PWM_RESOLUTION; 
-  for (int _pin_cnt = 0; _pin_cnt < _num_pins; _pin_cnt++) analogWrite(pins_motors[_pin_cnt], round(sentPWM));
+  for (int _pin_cnt = 0; _pin_cnt < 4; _pin_cnt++)
+  {
+    analogWrite(pins_motors[_pin_cnt], round(sentPWM));    
+  }
 }
 
+// Send PWM for 1 motor
+void send_motor_pwm(float currPWM, int motorNum)
+{
+  float sentPWM = (currPWM / PWM_PERIOD) * PWM_RESOLUTION; 
+  analogWrite(pins_motors[motorNum], round(sentPWM));    
+}
+
+// Teensy status LED 
+void toggleLED(unsigned long dur)
+{
+  if (millis() - led_timer > dur)
+  {
+    led_timer = millis();
+    led_state = !led_state;
+
+    if (led_state) digitalWrite(13,HIGH);
+    else digitalWrite(13,LOW);
+  }
+}
 
 // Declaring an union for the registers and the axis values.
 // The byte order does not match the byte order of
@@ -214,6 +279,14 @@ int MPU6050_write_reg(int reg, uint8_t data)
 #define STATE_STABILIZE (0x03)
 int state = STATE_IDLE;
 
+unsigned long arm_delay = 0;
+int currMotorPWM[4] = {1,1,1,1};
+unsigned long idle_timer = 0;
+unsigned long stabilize_timer = 0;
+float init_roll = 0.0;
+float init_pitch = 0.0;
+bool done_init;
+
 void setup(){
 
   // Setting up Serial
@@ -222,12 +295,25 @@ void setup(){
   // Setting up Motors/PWM
   setupMotors(pins_motors,4);
 
+  pinMode(13,OUTPUT);
+  digitalWrite(13,LOW);
+
+  done_init = false;
+
   // Setting up IMU
   Wire.begin();  
   Wire.beginTransmission(MPUAddress); //starts talking to IMU at address 0x68
   Wire.write(POWER);  // PWR_MGMT_1 register
   Wire.write(0);     // set to zero (wakes up the MPU-6050)
   Wire.endTransmission(true);
+
+  pwm_motor_1 = 950.0;
+  pwm_motor_2 = 950.0;
+  pwm_motor_3 = 950.0;
+  pwm_motor_4 = 950.0;
+
+  send_motor_pwm_all(PWM_BOTTOM);
+  delay(1000);
   
 }
 
@@ -239,12 +325,34 @@ void loop(){
   switch (state)
   {
     case (STATE_IDLE):
+
+      if (millis() - idle_timer > 2000)
+      {
+        idle_timer = millis();
+        state = STATE_ARM;
+        Serial.println("\nDrone ARMING!\n");
+        delay(1000);
+        break;  
+      }      
       break;
 
     case (STATE_ARM):
+
+      // Arm all 4 x motors
+      if (millis() - arm_delay > 2000)
+      {
+        arm_delay = millis();
+        currPWM = PWM_ARM;         
+        Serial.println("\nDrone ARMED!\n");
+        send_motor_pwm_all(currPWM); //Arm all 4 x motors
+        delay(1000);   
+        state = STATE_STABILIZE;  
+        break;
+      }      
       break;
 
     case (STATE_STABILIZE):
+      toggleLED(200);    
       break;
 
     default:
@@ -296,14 +404,49 @@ void loop(){
   //update previous angles with current angles in loop
   set_last_read_angle_data(t_now, cf_x, cf_y, cf_z);
 
-  // Motor Output  
-  send_motor_pwm(currPWM);
+  // Rough hard calibration of settled complemetary filter values
+   if (millis() - stabilize_timer > 35000 && done_init == false)
+      {
+        init_roll = cf_x + COMP_X_OFFSET;
+        init_pitch = cf_y + COMP_Y_OFFSET;
+        done_init = true;
+        //Serial.print("init_x_roll: "); Serial.println(init_roll);
+        //Serial.print("init_y_pitch: "); Serial.println(init_pitch);
+      }
+
+  // Offset from stabilized horizontal orientation for drone
+  roll_error = (cf_x + COMP_X_OFFSET) - init_roll;
+  pitch_error = (cf_y + COMP_Y_OFFSET) - init_pitch;
+
+  // Proportional Calculation
+  pid_px = kp * roll_error; //proportional component of roll
+  pid_py = kp * pitch_error; //proportional component of pitch
+
+  //Derivative Calculation
+  pid_dx = kd * (roll_error - prev_roll_error);
+  pid_dy = kd * (pitch_error - prev_pitch_error);
   
+  //PID output
+  pidx = pid_px + pid_dx; //sum of PID components for x
+  pidy = pid_py + pid_dy; //sum of PID comonents for y
+
+  prev_roll_error = roll_error;
+  prev_pitch_error = pitch_error;
+
+  // Actuate motors depending on roll and pitch error 
+  send_motor_pwm(pwm_motor_1,pins_motors[0]);
+  send_motor_pwm(pwm_motor_2,pins_motors[1]);
+  send_motor_pwm(pwm_motor_3,pins_motors[2]);
+  send_motor_pwm(pwm_motor_4,pins_motors[3]);
+
   //Printing the filtered roll and pitch angles for debugging
-  sprintf(imuData,"%0.3f,%0.3f\n",cf_x + COMP_X_OFFSET,cf_y + COMP_Y_OFFSET);  
+  //sprintf(imuData,"ROLL ERROR: %0.2f | PITCH ERROR: %0.2f\n",(cf_x + COMP_X_OFFSET) - init_roll,(cf_y + COMP_Y_OFFSET) - init_pitch);   
+  //Serial.print(imuData);  
+
+  //sprintf(imuData,"%0.2f %0.2f %0.2f %0.2f\n",pwm_motor_1,pwm_motor_2,pwm_motor_3,pwm_motor_4);   
+  sprintf(imuData,"%0.2f | %0.2f\n",pidx,pidy);   
   Serial.print(imuData);  
-  
-  delay(10);
+
+  delay(25);
  }
   
-
