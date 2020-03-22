@@ -1,4 +1,4 @@
-// Drone FBWA Demonstration
+// Drone Automatic Stabilise Mode Demonstration
 // Custom UAV frame + MPU6050 + Teensy 3.2
 // 4 x DYS 1806 motors with 20A BL_Heli ESCs
 
@@ -6,8 +6,42 @@
 // Adapted from tutorials/online resources
 // https://playground.arduino.cc/Main/MPU-6050/
 
+// Axes Convention for IMU
+//X axis = PITCH
+//Y axis = ROLL
+//Z axis = YAW
+
 #include <Wire.h> //for i2c
-#include <math.h> //math library
+#include <math.h> //math libraryc
+
+// -------------PID constants-------------
+float kp = 3.00;
+float ki = 0.00;
+float kd = 2.00;
+// ---------------------------------------
+
+// Proportional
+float pid_px = 0.0;
+float pid_py = 0.0;
+
+// Integral
+float pid_ix = 0.0;
+float pid_iy = 0.0;
+
+// Derivative
+float pid_dx = 0.0;
+float pid_dy = 0.0;
+
+// Resultant PID result
+float pidx = 0.0;
+float pidy = 0.0;
+
+// Error
+float roll_error = 0.0;
+float pitch_error = 0.0; 
+
+float prev_roll_error = 0.0;
+float prev_pitch_error = 0.0;
 
 const int MPUAddress = 0x68;  // I2C address of the MPU-6050
 int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
@@ -18,10 +52,12 @@ int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
 #define GYRO_FACTOR 131  //leads to angular velocity in degrees/sec
 #define RAD2DEGREE 180/3.14159; //radians to degreees
 #define ACCEL_FACTOR 16384
-#define COMP_X_OFFSET 54.3
-#define COMP_Y_OFFSET -44.4
+#define COMP_X_OFFSET -33.4
+#define COMP_Y_OFFSET 44.30
+#define SET_THROTTLE 1200.0
 
 // ACTUATION PARAMS
+// Following Betaflight configuration for motors
 #define MOTOR_1 23
 #define MOTOR_2 22
 #define MOTOR_3 21
@@ -30,10 +66,31 @@ int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,Tmp; //creating variables for raw data values
 #define PWM_RESOLUTION 4096
 #define PWM_FREQUENCY 50 // 50Hz 1 - 2 ms for PWM at UAV motors
 #define PWM_ARM 990.0
-#define PWM_BOTTOM 950.0
+#define PWM_BOTTOM 1000.0
+#define PWM_TOP 2000.0
 float currPWM = PWM_BOTTOM;
 
+unsigned long led_timer = 0;
+bool led_state = true;
 int pins_motors[] = {MOTOR_1,MOTOR_2,MOTOR_3,MOTOR_4};
+float pwm_motor_1 = 0.0;
+float pwm_motor_2 = 0.0;
+float pwm_motor_3 = 0.0;
+float pwm_motor_4 = 0.0;
+
+unsigned long motor1_refresh = 0.0;
+unsigned long t_now  = 0.0;
+unsigned long prev_time = 0.0;
+
+unsigned long arm_delay = 0;
+int currMotorPWM[4] = {1,1,1,1};
+unsigned long idle_timer = 0;
+unsigned long stabilize_timer = 0;
+float init_roll = 0.0;
+float init_pitch = 0.0;
+bool done_init;
+unsigned long init_time;
+bool drone_armed = false;
 
 // Setting up PWM for Drone Actuators:
 void setupMotors(int pins_motors[],int num_pins)
@@ -49,16 +106,33 @@ void setupMotors(int pins_motors[],int num_pins)
 // freq = 1 / period
 // (PWM between 1000-2000 / 20ms) * 4096
 // PWM requires is 1 - 2 ms (1000 - 2000 micro sec)
-void send_motor_pwm(float currPWM)
+void send_motor_pwm_all(float currPWM)
 {
   float sentPWM = (currPWM / PWM_PERIOD) * PWM_RESOLUTION; 
-  for (int _pin_cnt = 0; _pin_cnt < 4; _pin_cnt++) analogWrite(pins_motors[_pin_cnt], round(sentPWM));
+  for (int _pin_cnt = 0; _pin_cnt < 4; _pin_cnt++)
+  {
+    analogWrite(pins_motors[_pin_cnt], round(sentPWM));    
+  }
+}
+
+// Send PWM for 1 motor
+void send_motor_pwm(float currPWM, int motorNum)
+{
+  float sentPWM = (currPWM / PWM_PERIOD) * PWM_RESOLUTION; 
+  analogWrite(pins_motors[motorNum], round(sentPWM));    
 }
 
 // Teensy status LED 
 void toggleLED(unsigned long dur)
 {
-  
+  if (millis() - led_timer > dur)
+  {
+    led_timer = millis();
+    led_state = !led_state;
+
+    if (led_state) digitalWrite(13,HIGH);
+    else digitalWrite(13,LOW);
+  }
 }
 
 // Declaring an union for the registers and the axis values.
@@ -229,30 +303,46 @@ void setup(){
   // Setting up Motors/PWM
   setupMotors(pins_motors,4);
 
+  pinMode(13,OUTPUT);
+  digitalWrite(13,LOW);
+
+  done_init = false;
+  init_time = millis();
+
   // Setting up IMU
   Wire.begin();  
   Wire.beginTransmission(MPUAddress); //starts talking to IMU at address 0x68
   Wire.write(POWER);  // PWR_MGMT_1 register
   Wire.write(0);     // set to zero (wakes up the MPU-6050)
   Wire.endTransmission(true);
+
+  pwm_motor_1 = PWM_ARM;
+  pwm_motor_2 = PWM_ARM;
+  pwm_motor_3 = PWM_ARM;
+  pwm_motor_4 = PWM_ARM;
+
+  send_motor_pwm_all(PWM_BOTTOM);
+  delay(1000);
   
 }
 
 void loop(){
 
-  accel_t_gyro_union accel_t_gyro;
-  unsigned long t_now = millis();
+  accel_t_gyro_union accel_t_gyro; //struct for imu
+  prev_time = init_time;
+  t_now = millis();
+  unsigned long elapsed_time = (t_now - prev_time)/1000.0;
 
   switch (state)
   {
     case (STATE_IDLE):
 
-      unsigned long idle_timer;
       if (millis() - idle_timer > 2000)
       {
-        state = STATE_ARM;
-        currPWM = PWM_BOTTOM;      
         idle_timer = millis();
+        state = STATE_ARM;
+        Serial.println("\nDrone ARMING!\n");
+        delay(1000);
         break;  
       }      
       break;
@@ -260,71 +350,129 @@ void loop(){
     case (STATE_ARM):
 
       // Arm all 4 x motors
-      currPWM = PWM_ARM;
-      
+      if (millis() - arm_delay > 2000)
+      {
+        arm_delay = millis();
+        currPWM = PWM_ARM;         
+        Serial.println("\nDrone ARMED!\n");
+        drone_armed = true;
+        send_motor_pwm_all(currPWM); //Arm all 4 x motors        
+        delay(1000);   
+        state = STATE_STABILIZE;  
+        break;
+      }      
       break;
 
     case (STATE_STABILIZE):
+      toggleLED(200);    
+
+      MPU6050_read (ACCEL_XOUT_HIGH, (uint8_t *) &accel_t_gyro, sizeof(accel_t_gyro));
+
+      uint8_t swap;
+      #define SWAP(x,y) swap = x; x = y; y = swap
+     
+      SWAP (accel_t_gyro.reg.x_accel_h, accel_t_gyro.reg.x_accel_l);
+      SWAP (accel_t_gyro.reg.y_accel_h, accel_t_gyro.reg.y_accel_l);
+      SWAP (accel_t_gyro.reg.z_accel_h, accel_t_gyro.reg.z_accel_l);
+      SWAP (accel_t_gyro.reg.t_h, accel_t_gyro.reg.t_l);
+      SWAP (accel_t_gyro.reg.x_gyro_h, accel_t_gyro.reg.x_gyro_l);
+      SWAP (accel_t_gyro.reg.y_gyro_h, accel_t_gyro.reg.y_gyro_l);
+      SWAP (accel_t_gyro.reg.z_gyro_h, accel_t_gyro.reg.z_gyro_l);
+    
+      AcX = accel_t_gyro.value.x_accel;
+      AcY = accel_t_gyro.value.x_accel;
+      AcZ = accel_t_gyro.value.y_accel;
+      GyX = accel_t_gyro.value.x_gyro/GYRO_FACTOR;
+      GyY = accel_t_gyro.value.y_gyro/GYRO_FACTOR; 
+      GyZ = accel_t_gyro.value.z_gyro/GYRO_FACTOR;
+    
+      //Accelerometer Y (-rho). turning around y axis results in vector on x axis
+      float comp_accel_y = atan(-1.0*AcX/sqrt(pow(AcY,2) + pow(AcZ,2)))*RAD2DEGREE;
+      
+      //Accelerometer X (phi). turning around x axis results in vector on y axis
+      float comp_accel_x = atan(AcY/sqrt(pow(AcX,2) + pow(AcZ,2)))*RAD2DEGREE;
+      float theta = 0; //z-axis angle
+    
+      //Complementary Filter - removes noise and drift from IMU and Gyro
+      //Filtered Angle = alpha * (angle + GyroData*dt) + (1-alpha)*Accelerometer Data
+      
+      double dt = (t_now - last_read_time)/1000.0; //timestep
+      //Current angular position = 
+      //Angular velocity (degree/s) * time between readings + previous angular postion
+      float gyro_x = GyX * dt + last_x_angle;
+      float gyro_y = GyY * dt + last_y_angle;
+      float gyro_z = GyZ * dt + last_z_angle;
+    
+      float alpha = 0.96; //weighting, which measurement to use more, accel or gyro
+      float cf_x = (alpha * gyro_x) + (1.0 - alpha)*comp_accel_x;
+      float cf_y = (alpha * gyro_y) + (1.0 - alpha)*comp_accel_y;
+      float cf_z = gyro_z;
+    
+      //update previous angles with current angles in loop
+      set_last_read_angle_data(t_now, cf_x, cf_y, cf_z);
+    
+      // Rough hard calibration of settled complemetary filter values
+       if (millis() - stabilize_timer > 15000 && done_init == false)
+       {
+            init_roll = cf_x + COMP_X_OFFSET;
+            init_pitch = cf_y + COMP_Y_OFFSET;
+            done_init = true;
+            //Serial.print("init_x_roll: "); Serial.println(init_roll);
+            //Serial.print("init_y_pitch: "); Serial.println(init_pitch);
+       }      
+      
+      // Error -> Offset from stabilized horizontal orientation for UAV
+      roll_error = (cf_x + COMP_X_OFFSET) - init_roll;
+      pitch_error = (cf_y + COMP_Y_OFFSET) - init_pitch;
+      
+      //Printing the filtered roll and pitch angles for debugging
+      //sprintf(imuData,"ROLL: %0.2f | PITCH: %0.2f\n",cf_x+ COMP_X_OFFSET,cf_y+ COMP_Y_OFFSET);   
+      //Serial.print(imuData);  
+      
       break;
 
     default:
       break;
-  }  
-  
-  MPU6050_read (ACCEL_XOUT_HIGH, (uint8_t *) &accel_t_gyro, sizeof(accel_t_gyro));
+  }    
+      
+      // Proportional Calculation
+      pid_px = kp * roll_error; //proportional component of roll
+      pid_py = kp * pitch_error; //proportional component of pitch
+    
+      //Derivative Calculation
+      pid_dx = kd * ((roll_error - prev_roll_error)/elapsed_time);
+      pid_dy = kd * ((pitch_error - prev_pitch_error)/elapsed_time);
+      
+      //PID output
+      pidx = pid_px + pid_dx; //sum of PID components for x
+      pidy = pid_py + pid_dy; //sum of PID comonents for y
+    
+      // Calculate required motor corrections
+      // depending on roll and pitch error from IMU
+      if (drone_armed == true && done_init == true)
+      { 
+        // PITCH
+        pwm_motor_1 = SET_THROTTLE + (2.20*pidx);    
+        pwm_motor_3 = SET_THROTTLE + (2.20*pidx);    
+        pwm_motor_2 = SET_THROTTLE - (1.5*pidx);    
+        pwm_motor_4 = SET_THROTTLE - (1.5*pidx);    
+      }
+    
+      if (pwm_motor_1 > PWM_TOP) pwm_motor_1 = PWM_TOP;
+      if (pwm_motor_1 < PWM_BOTTOM) pwm_motor_1 = PWM_BOTTOM;
+    
+  // Actuate motors 
+  send_motor_pwm(pwm_motor_1,pins_motors[0]);
+  send_motor_pwm(pwm_motor_2,pins_motors[1]);
+  send_motor_pwm(pwm_motor_3,pins_motors[2]);
+  send_motor_pwm(pwm_motor_4,pins_motors[3]);  
 
-  uint8_t swap;
-  #define SWAP(x,y) swap = x; x = y; y = swap
- 
-  SWAP (accel_t_gyro.reg.x_accel_h, accel_t_gyro.reg.x_accel_l);
-  SWAP (accel_t_gyro.reg.y_accel_h, accel_t_gyro.reg.y_accel_l);
-  SWAP (accel_t_gyro.reg.z_accel_h, accel_t_gyro.reg.z_accel_l);
-  SWAP (accel_t_gyro.reg.t_h, accel_t_gyro.reg.t_l);
-  SWAP (accel_t_gyro.reg.x_gyro_h, accel_t_gyro.reg.x_gyro_l);
-  SWAP (accel_t_gyro.reg.y_gyro_h, accel_t_gyro.reg.y_gyro_l);
-  SWAP (accel_t_gyro.reg.z_gyro_h, accel_t_gyro.reg.z_gyro_l);
-
-  AcX = accel_t_gyro.value.x_accel;
-  AcY = accel_t_gyro.value.x_accel;
-  AcZ = accel_t_gyro.value.y_accel;
-  GyX = accel_t_gyro.value.x_gyro/GYRO_FACTOR;
-  GyY = accel_t_gyro.value.y_gyro/GYRO_FACTOR; 
-  GyZ = accel_t_gyro.value.z_gyro/GYRO_FACTOR;
-
-  //Accelerometer Y (-rho). turning around y axis results in vector on x axis
-  float comp_accel_y = atan(-1.0*AcX/sqrt(pow(AcY,2) + pow(AcZ,2)))*RAD2DEGREE;
-  
-  //Accelerometer X (phi). turning around x axis results in vector on y axis
-  float comp_accel_x = atan(AcY/sqrt(pow(AcX,2) + pow(AcZ,2)))*RAD2DEGREE;
-  float theta = 0; //z-axis angle
-
-  //Complementary Filter - removes noise and drift from IMU and Gyro
-  //Filtered Angle = alpha * (angle + GyroData*dt) + (1-alpha)*Accelerometer Data
-  
-  double dt = (t_now - last_read_time)/1000.0; //timestep
-  //Current angular position = 
-  //Angular velocity (degree/s) * time between readings + previous angular postion
-  float gyro_x = GyX * dt + last_x_angle;
-  float gyro_y = GyY * dt + last_y_angle;
-  float gyro_z = GyZ * dt + last_z_angle;
-
-  float alpha = 0.96; //weighting, which measurement to use more, accel or gyro
-  float cf_x = (alpha * gyro_x) + (1.0 - alpha)*comp_accel_x;
-  float cf_y = (alpha * gyro_y) + (1.0 - alpha)*comp_accel_y;
-  float cf_z = gyro_z;
-
-  //update previous angles with current angles in loop
-  set_last_read_angle_data(t_now, cf_x, cf_y, cf_z);
-
-  // Motor Output  
-  send_motor_pwm(currPWM);
-  
-  //Printing the filtered roll and pitch angles for debugging
-  sprintf(imuData,"%0.3f,%0.3f\n",cf_x + COMP_X_OFFSET,cf_y + COMP_Y_OFFSET);  
+  sprintf(imuData,"R: %0.2f | P: %0.2f | M1: %0.2f | M2: %0.2f | M3: %0.2f | M4: %0.2f\n",roll_error,pitch_error,pwm_motor_1,pwm_motor_2,pwm_motor_3,pwm_motor_4);   
   Serial.print(imuData);  
 
-  send_motor_pwm(currPWM); //send PWM to UAV actuators
-  
-  delay(15);
+  prev_roll_error = roll_error;
+  prev_pitch_error = pitch_error;  
+
+  delay(25);
  }
   
